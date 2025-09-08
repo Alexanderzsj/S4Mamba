@@ -1,5 +1,5 @@
 # S4Mamba
-## U3PNet: Enhancing Image Fusion through Spatial-Spectral Network with Prompt Tuning for Super-Resolution
+## S4Mamba: Selective Spatial-Spectral Similarity Mamba for Hyperspectral Image Classification
 
 This repository presents the official implementation of **S4Mamba**, a novel approach for enhancing image fusion through a Spatial-Spectral Network with Prompt Tuning, specifically designed for Super-Resolution tasks. Our framework, **S4Mamba**, leverages advanced techniques to achieve superior performance in hyperspectral image processing.
 
