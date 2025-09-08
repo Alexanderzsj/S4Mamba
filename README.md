@@ -1,4 +1,3 @@
-```
 # S4Mamba
 ## U3PNet: Enhancing Image Fusion through Spatial-Spectral Network with Prompt Tuning for Super-Resolution
 
@@ -64,7 +63,3 @@ Once the environment is set up and datasets are prepared, you can run the main t
 
 ```bash
 python main.py
-```
-
----
-
