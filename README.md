@@ -13,8 +13,8 @@ To set up the required environment, we highly recommend using `conda`.
 
 1.  **Create and Activate Conda Environment:**
     ```bash
-    conda create -n MambaHSI_env python=3.9
-    conda activate MambaHSI_env
+    conda create -n Mamba_env python=3.9
+    conda activate Mamba_env
     ```
 
 2.  **Install PyTorch and Torchvision:**
