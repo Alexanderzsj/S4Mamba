@@ -1,212 +1,241 @@
-import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+from einops import rearrange
 from mamba_ssm import Mamba
-from torch import cosine_similarity
 
 
-class spa_spe_similarity(nn.Module):
+class spa_similarity(nn.Module):
+    # 空间相似度计算，支持基于置信度图的锚点引导
     def __init__(self, in_channels):
-        super(spa_spe_similarity, self).__init__()
-        self.to_ab = nn.Conv2d(in_channels, in_channels * 2, 1)
-        self.eps = nn.Parameter(torch.zeros(1))
+        super(spa_similarity, self).__init__()
+        self.conv = nn.Conv2d(in_channels, in_channels * 2, 1)
         self.softmax = nn.Softmax(dim=-1)
 
-    
-    def _cal_spa_entropy(self, x_spa):
-        probs = self.softmax(x_spa)
-        shannon_probs = torch.log(probs + 1e-8)
-        entropy = -torch.sum(probs * shannon_probs, dim=-1)
-        return entropy
-
-
-    def forward(self, x):
+    def forward(self, x, conf_map=None):
         batch_size, c, h, w = x.size()
-        a, b = self.to_ab(x).chunk(2, dim=1)
+        a, b = self.conv(x).chunk(2, dim=1)
+        a_spa = a.view(batch_size, c, -1).permute(0, 2, 1) 
+        b_spa = b.view(batch_size, c, -1).permute(0, 2, 1) 
 
-        a_spa = a.view(batch_size, c, -1).permute(0, 2, 1)
-        b_spa = b.view(batch_size, c, -1).permute(0, 2, 1)
-
-        entropy_spa = self._cal_spa_entropy(a_spa)
-        max_entropy_spa = torch.argmax(entropy_spa, dim=-1)
-        selective_vec = torch.gather(a_spa, 1, max_entropy_spa.unsqueeze(1).unsqueeze(2).expand(-1, -1, c))
-        sim_spa = F.cosine_similarity(selective_vec, b_spa, dim=2)
-        atten_spa = self.softmax(torch.pow(sim_spa, 2)) # (batch_size, h*w)
-        atten_spa = atten_spa.unsqueeze(2) # (batch_size, h*w, 1)
-
-        spa_x = torch.mul(atten_spa, b_spa)
-        spa_x = spa_x.permute(0, 2, 1).contiguous().view(batch_size, c, h, w) + x
-
-        ###################################################################
-
-        a_spe = a.view(batch_size, c, h * w)
-
-        sim_spe = torch.bmm(a_spe, a_spe.permute(0, 2, 1))
-        norm_spe = torch.norm(a_spe, p=2, dim=2, keepdim=True)
-        norm_mat = torch.bmm(norm_spe, norm_spe.permute(0, 2, 1))
-
-        atten_spe = self.softmax(sim_spe / (norm_mat + self.eps))
-        spe_weight = torch.bmm(atten_spe, a_spe)
-        spe_x = spe_weight.view(batch_size, c, h, w)
-
-        return spa_x, spe_x
+        if conf_map is not None:
+            conf_flat = conf_map.view(batch_size, -1) 
+            anchor_idx = torch.argmax(conf_flat, dim=-1) 
+        else:
+            anchor_idx = torch.full((batch_size,), (h // 2) * w + (w // 2), device=x.device)
+            
+        selective_vec = torch.gather(a_spa, 1, anchor_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, c)) 
+        
+        sim_spa = F.cosine_similarity(selective_vec, b_spa, dim=2) 
+        atten_spa = self.softmax(torch.pow(sim_spa, 2)).unsqueeze(2) 
+        
+        spa_x = torch.mul(atten_spa, b_spa).permute(0, 2, 1).contiguous().view(batch_size, c, h, w)
+        return spa_x
 
 
-class SpeMamba(nn.Module):
-    def __init__(self,channels, token_num=8, use_residual=True, group_num=4):
-        super(SpeMamba, self).__init__()
-        self.token_num = token_num
-        self.use_residual = use_residual
-
-        self.group_channel_num = math.ceil(channels / token_num)
-        self.channel_num = self.token_num * self.group_channel_num
-
-        self.mamba = Mamba(d_model=self.group_channel_num, d_state=16, d_conv=4, expand=2, )
-
-        self.proj = nn.Sequential(
-            nn.GroupNorm(group_num, self.channel_num),
-            nn.SiLU()
+class spe_similarity(nn.Module):
+    # 光谱特征聚合，提取光谱序列的统计量（均值与方差）并生成动态门控
+    def __init__(self, in_channels):
+        super(spe_similarity, self).__init__()
+    
+        self.fuse_conv = nn.Sequential(
+            nn.Conv1d(in_channels=2, out_channels=16, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(in_channels=16, out_channels=1, kernel_size=3, padding=1),
+            nn.Sigmoid()
         )
+        
+        self.proj = nn.Conv1d(in_channels, in_channels, kernel_size=1)
 
-    def padding_feature(self,x):
-        B, C, H, W = x.shape
-        if C < self.channel_num:
-            pad_c = self.channel_num - C
-            pad_features = torch.zeros((B, pad_c, H, W)).to(x.device)
-            cat_features = torch.cat([x, pad_features], dim=1)
-            return cat_features
-        else:
-            return x
+    def forward(self, x, conf_map=None):
+        batch_size, c, h, w = x.size()
+        x_flat = x.view(batch_size, c, -1) 
 
-    def forward(self,x):
-        x_pad = self.padding_feature(x)
-        x_pad = x_pad.permute(0, 2, 3, 1).contiguous()
-        B, H, W, C_pad = x_pad.shape
-        x_flat = x_pad.view(B * H * W, self.token_num, self.group_channel_num)
-        x_flat = self.mamba(x_flat)
-        x_recon = x_flat.view(B, H, W, C_pad)
-        x_recon = x_recon.permute(0, 3, 1, 2).contiguous()
-        x_proj = self.proj(x_recon)
-        if self.use_residual:
-            return x + x_proj
+        if conf_map is not None:
+            weights = conf_map.view(batch_size, 1, -1) 
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
         else:
-            return x_proj
+            weights = torch.ones(batch_size, 1, h * w, device=x.device) / (h * w)
+
+        mu = torch.bmm(x_flat, weights.transpose(1, 2)) 
+
+        diff_sq = (x_flat - mu) ** 2 
+        var = torch.bmm(diff_sq, weights.transpose(1, 2)) 
+        sigma = torch.sqrt(var + 1e-8) 
+
+        stats = torch.cat([mu.squeeze(-1).unsqueeze(1), sigma.squeeze(-1).unsqueeze(1)], dim=1) 
+        gate = self.fuse_conv(stats)
+
+        gate = gate.transpose(1, 2) 
+        spe_vector = mu * gate 
+        
+        spe_vector = self.proj(spe_vector).unsqueeze(-1)
+
+        return spe_vector
 
 
 class SpaMamba(nn.Module):
-    def __init__(self, channels, use_residual=True, group_num=4, use_proj=True):
+    # 空间 Mamba 分支，处理空间维度特征
+    def __init__(self, channels, group_num=4):
         super(SpaMamba, self).__init__()
-        self.use_residual = use_residual
-        self.use_proj = use_proj
+        self.spa_sim = spa_similarity(channels)
+        self.dpe = nn.Conv2d(channels, channels, 3, 1, 1, groups=channels)
+        self.norm1 = nn.LayerNorm(channels)
+        self.mamba = Mamba(d_model=channels, d_state=16, d_conv=3, expand=2)
+        self.norm2 = nn.LayerNorm(channels)
+        self.mlp = nn.Sequential(nn.Linear(channels, channels * 2), nn.SiLU(), nn.Linear(channels * 2, channels))
+
+    def forward(self, x, conf_map=None):
+        x_pos = self.spa_sim(x, conf_map) + self.dpe(x)
+        B, C, H, W = x_pos.shape
+        x_flat = x_pos.view(B, C, H * W).permute(0, 2, 1).contiguous() 
+        x_flat = x_flat + self.mamba(self.norm1(x_flat))
+        x_flat = x_flat + self.mlp(self.norm2(x_flat))
+        return x_flat.permute(0, 2, 1).contiguous().view(B, C, H, W) + x
+
+
+class SpeMamba(nn.Module):
+    # 光谱 Mamba 分支，学习通道/光谱维度的长序列依赖
+    def __init__(self, channels, d_inner=64):
+        super(SpeMamba, self).__init__()
         
-        self.mamba = Mamba(d_model=channels, d_state=16, d_conv=4, expand=2)
+        self.spe_agg = SpeAggregation(channels) 
+        self.up_proj = nn.Linear(1, d_inner)
+        self.norm1 = nn.LayerNorm(d_inner)
+        self.mamba_fwd = Mamba(d_model=d_inner, d_state=16, d_conv=3, expand=2)
+        self.mamba_bwd = Mamba(d_model=d_inner, d_state=16, d_conv=3, expand=2)
+        self.fusion_conv = nn.Linear(d_inner * 2, d_inner)
+        self.norm2 = nn.LayerNorm(d_inner)
+        self.mlp = nn.Sequential(nn.Linear(d_inner, d_inner * 2), nn.SiLU(), nn.Linear(d_inner * 2, d_inner))
+        self.down_proj = nn.Linear(d_inner, 1)
 
-        self.mlp = nn.Sequential(
-            nn.Linear(channels, channels * 2), 
-            nn.ReLU(), 
-            nn.Linear(channels * 2, channels)
-        )
+    def forward(self, x, conf_map=None):
+        x_sim = self.spe_agg(x, conf_map) 
+        B, C, _, _ = x_sim.shape
         
-        if self.use_proj:
-            self.proj = nn.Sequential(
-                nn.GroupNorm(group_num, channels),
-                nn.SiLU()
-            )
-
-    def forward(self, x):
-        B, C, H, W = x.shape # x shape: (B, C, H, W)
+        x_emb = self.up_proj(x_sim.view(B, C, 1))
+        x_norm1 = self.norm1(x_emb)
+        out_fwd = self.mamba_fwd(x_norm1)
+        out_bwd = torch.flip(self.mamba_bwd(torch.flip(x_norm1, dims=[1])), dims=[1])
+        x_emb = x_emb + self.fusion_conv(torch.cat([out_fwd, out_bwd], dim=-1)) 
+        x_emb = x_emb + self.mlp(self.norm2(x_emb)) 
         
-        x_re = x.permute(0, 2, 3, 1).contiguous()
-        x_flat = x_re.view(B, H * W, C)
+        refined_spe = x_sim + self.down_proj(x_emb).view(B, C, 1, 1) 
+        return x + refined_spe
+
+
+class FusionEncoder(nn.Module):
+    # 基于 O(N) 线性注意力的空间与光谱多头特征融合
+    def __init__(self, channels, heads=8):
+        super().__init__()
+        self.heads = heads
         
-        x_mlp_out = self.mlp(x_flat) # (B, H*W, C)        
-        x_mamba_out = self.mamba(x_mlp_out) # (B, H*W, C)
+        self.to_q = nn.Linear(channels, channels, bias=False)
+        self.to_k = nn.Linear(channels, channels, bias=False)
+        self.to_v = nn.Linear(channels, channels, bias=False)
 
+    def forward(self, t1, t2):
+        B, C, H, W = t1.shape
+
+        t1_flat = rearrange(t1, 'b c h w -> b (h w) c')
+        t2_flat = rearrange(t2, 'b c h w -> b (h w) c')
+
+        q = rearrange(self.to_q(t2_flat), 'b n (h d) -> b h n d', h=self.heads)
+        k = rearrange(self.to_k(t1_flat), 'b n (h d) -> b h n d', h=self.heads)
+        v = rearrange(self.to_v(t1_flat), 'b n (h d) -> b h n d', h=self.heads)
+
+        q = q.softmax(dim=-1)  
+        k = k.softmax(dim=-2)  
+
+        context = torch.matmul(k.transpose(-1, -2), v) 
+        out_flat = torch.matmul(q, context)
         
-        x_recon = x_mamba_out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous() # restore original shape (B, C, H, W)
-        
-        if self.use_proj:
-            x_recon = self.proj(x_recon)
+        out_flat = rearrange(out_flat, 'b h n d -> b n (h d)')
+        out = rearrange(out_flat, 'b (h w) c -> b c h w', h=H, w=W)
 
-        if self.use_residual:
-            return x_recon + x
-        else:
-            return x_recon
-
-
-class BothMamba(nn.Module):
-    def __init__(self,channels,token_num,use_residual, num_layers=4, group_num=4,use_att=True):
-        super(BothMamba, self).__init__()
-        self.use_att = use_att
-        self.use_residual = use_residual
-        self.num_layers = num_layers
-        if self.use_att:
-            self.weights = nn.Parameter(torch.ones(2) / 2)
-            self.softmax = nn.Softmax(dim=0)
-
-        self.spa_mamba = SpaMamba(channels,use_residual=use_residual,group_num=group_num)
-        self.spe_mamba = SpeMamba(channels,token_num=token_num,use_residual=use_residual,group_num=group_num)
-
-        self.Conv_spa = nn.Sequential(nn.Conv2d(in_channels=channels,out_channels=channels,kernel_size=1,stride=1,groups=channels), 
-                                      nn.LeakyReLU(),)
-        self.Conv_spe = nn.Sequential(nn.Conv2d(in_channels=channels,out_channels=channels,kernel_size=1,stride=1,groups=channels), 
-                                      nn.LeakyReLU(),)
-
-    def forward(self,x, x_spa, x_spe):
-        
-        for i in range(self.num_layers):
-            spa_x = self.spa_mamba(x_spa)
-            spe_x = self.spe_mamba(x_spe)
-
-        if self.use_att:
-            weights = self.softmax(self.weights)
-            fusion_x = self.Conv_spa(spa_x) * weights[0] + self.Conv_spe(spe_x) * weights[1]
-        else:
-            fusion_x = spa_x + spe_x
-
-        # if self.use_residual: 
-        #     return fusion_x
-        # else: 
-        #     return fusion_x
-        return fusion_x
+        return out
 
 
 class S4Mamba(nn.Module):
-    def __init__(self,in_channels=128, num_classes=10, hidden_dim=64, num_layers=6, use_residual=True, token_num=8, group_num=4, use_att=True):
+    # 主网络架构：采用两阶段（盲看与置信度引导）的空间-光谱联合建模
+    def __init__(self, in_channels=128, num_classes=10, hidden_dim=64, group_num=4):
         super(S4Mamba, self).__init__()
-
-        self.patch_embedding = nn.Sequential(nn.Conv2d(in_channels=in_channels,out_channels=hidden_dim,kernel_size=1,stride=1,padding=0),
-                                            nn.GroupNorm(group_num,hidden_dim),
-                                            nn.Conv2d(in_channels=hidden_dim,out_channels=hidden_dim,kernel_size=3,stride=1,padding=1),
-                                            nn.SiLU())
+        self.patch_embedding = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, 1), 
+            nn.GroupNorm(group_num, hidden_dim), 
+            nn.SiLU()
+        )
       
-        self.spa_spe_similarity = spa_spe_similarity(hidden_dim)
+        self.spa_branch = SpaMamba(hidden_dim, group_num)
+        self.spe_branch = SpeMamba(hidden_dim)
+        
+        self.fusion = FusionEncoder(channels=hidden_dim, num_classes=num_classes)
+        
+        self.feature_to_dense = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, 1), 
+            nn.GroupNorm(group_num, hidden_dim), 
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim, num_classes, 1) 
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
 
-        self.mamba = BothMamba(hidden_dim,token_num,use_residual, num_layers, group_num,use_att)
+        self.theta = nn.Parameter(torch.tensor([1.0, 1.0, 3.0]))
+
+    def _get_logits(self, t1, t2, t_cross):
+            dense1 = self.feature_to_dense(t1)
+            dense2 = self.feature_to_dense(t2)
+            dense_cross = self.feature_to_dense(t_cross)
+            
+            w1 = torch.sigmoid(self.theta[0])
+            w2 = torch.sigmoid(self.theta[1])
+            
+            dense_fused = dense_cross + w1 * dense1 + w2 * dense2
+            return dense_fused
+
+    def _calc_confidence_map(self, dense_logits):
+        # 利用香农熵计算特征级置信度，为第二阶段提供引导
+        probs = F.softmax(dense_logits, dim=1)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1, keepdim=True) 
+        
+        B = dense_logits.size(0)
+        entropy_flat = entropy.view(B, -1)
+        min_e = entropy_flat.amin(dim=1).view(B, 1, 1, 1)
+        max_e = entropy_flat.amax(dim=1).view(B, 1, 1, 1)
+        
+        conf_map = 1.0 - (entropy - min_e) / (max_e - min_e + 1e-8)
+        return conf_map
+
+    def forward(self, x):
+        x = self.patch_embedding(x.permute(0, 3, 1, 2))
+        
+        # 第一遍：盲看 (Initial Selection)
+        spa_1 = self.spa_branch(x, conf_map=None)
+        spe_1 = self.spe_branch(x, conf_map=None)
+        t1, t2, t_cross = self.fusion(spa_1, spe_1)
+        
+        dense_logits_1 = self._get_logits(t1, t2, t_cross) 
+        logits1 = self.pool(dense_logits_1).flatten(1) 
+        
+        with torch.no_grad(): 
+            conf_map = self._calc_confidence_map(dense_logits_1) 
+        
+        # 第二遍：指引看 (Guided Selection，分支受 conf_map 优化)
+        spa_2 = self.spa_branch(x, conf_map=conf_map)
+        spe_2 = self.spe_branch(x, conf_map=conf_map)
+        
+        t1_2, t2_2, t_cross_2 = self.fusion(spa_2, spe_2)
+        dense_logits_2 = self._get_logits(t1_2, t2_2, t_cross_2)
+        logits2 = self.pool(dense_logits_2).flatten(1)
+        
+        if self.training:
+            return logits1, logits2
+        else:
+            return logits2
 
 
-        self.cls_head = nn.Sequential(nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1, padding=0),
-                                      nn.GroupNorm(group_num,hidden_dim),
-                                      nn.SiLU(),
-                                      nn.Conv2d(in_channels=hidden_dim,out_channels=num_classes,kernel_size=1,stride=1,padding=0),
-                                      nn.AdaptiveAvgPool2d(1),
-                                      )
-
-    def forward(self,x):
-        x = x.permute(0, 3, 1, 2)
-        x = self.patch_embedding(x)
-        x_spa, x_spe = self.spa_spe_similarity(x)
-        x = self.mamba(x, x_spa, x_spe)
-        logits = self.cls_head(x)
-        logits = logits.view(logits.size(0), -1)
-        return logits
-
-
-
-if __name__=='__main__':
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    x = torch.randn(2, 9, 9, 103).to(device)
-    model = S4Mamba(in_channels=103, num_classes=10).to(device)
-    out = model(x).to(device)
-    print(out.shape)
+if __name__=="__main__":
+    model = S4Mamba(in_channels=128, num_classes=10, hidden_dim=64)
+    model.train() 
+    input_tensor = torch.randn(2, 128, 16, 16) 
+    out1, out2 = model(input_tensor)
+    print(f"第一轮分类输出形状: {out1.shape}, 最终引导输出形状: {out2.shape}")
