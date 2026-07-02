@@ -28,9 +28,9 @@ def build_model(args):
         from models.S4Mamba.S4Mamba import S4Mamba
         args.model_type=1 # load spatial data, function: generate_spatial_iter
         args.model_3D_spa=0 # laod 3D data
-        args.step_size=50
-        args.gamma=0.99
-        model = S4Mamba(in_channels=args.channels, num_classes=args.num_classes, hidden_dim=128)
+        args.step_size=200
+        args.gamma=0.8
+        model = S4Mamba(in_channels=args.channels, num_classes=args.num_classes, hidden_dim=64)
 
 
 
